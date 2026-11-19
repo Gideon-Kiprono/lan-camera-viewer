@@ -1,4 +1,4 @@
-"""LAN Camera Viewer - Phase 5: recording with the R key."""
+"""LAN Camera Viewer - Phase 6: error handling, reconnects, safe shutdown."""
 
 import os
 import sys
@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 
 import cv2
+import numpy as np
+import requests
 
 from config import ConfigError, load_config
 
@@ -15,12 +17,22 @@ SCREENSHOT_DIR = "screenshots"
 RECORDING_DIR = "recordings"
 MESSAGE_SECONDS = 2.0
 FALLBACK_FPS = 15.0
+CONNECT_TIMEOUT = 5       # seconds to wait for the camera to answer
+READ_TIMEOUT_MS = 5000    # how long a frame read may block before failing
+MAX_READ_FAILURES = 3     # consecutive failed reads before treating it as a drop
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 WHITE = (255, 255, 255)  # OpenCV uses BGR order, not RGB
 BLACK = (0, 0, 0)
 GREEN = (0, 200, 0)
 RED = (0, 0, 255)
+AMBER = (0, 180, 255)
 
+
+class UserQuit(Exception):
+    """Raised when the user presses Esc while we are not in the main loop."""
+
+
+# ---------- drawing and processing ----------
 
 def resize_to_width(frame, width):
     """Resize to a fixed width, keeping the aspect ratio."""
@@ -49,6 +61,10 @@ class FpsCounter:
         self.fps = 0.0
         self._last = None
 
+    def reset(self):
+        self.fps = 0.0
+        self._last = None
+
     def update(self):
         now = time.perf_counter()
         if self._last is not None:
@@ -71,6 +87,15 @@ def draw_overlay(frame, camera_name, fps):
     put_text(frame, f"{w}x{h}", (10, 75))
     put_text(frame, f"FPS: {fps:.1f}", (10, 100))
 
+
+def draw_rec_status(frame, seconds):
+    w = frame.shape[1]
+    mins, secs = divmod(int(seconds), 60)
+    cv2.circle(frame, (w - 120, 20), 7, RED, -1)
+    put_text(frame, f"REC {mins:02d}:{secs:02d}", (w - 105, 26), color=RED)
+
+
+# ---------- files ----------
 
 def save_screenshot(frame):
     """Save a frame to screenshots/ with a unique timestamped name."""
@@ -102,7 +127,6 @@ class Recorder:
 
     def start(self, frame, fps):
         h, w = frame.shape[:2]
-        # Clamp the FPS so playback speed is sensible.
         fps = fps if 5.0 <= fps <= 60.0 else FALLBACK_FPS
         try:
             os.makedirs(RECORDING_DIR, exist_ok=True)
@@ -125,7 +149,6 @@ class Recorder:
             return
         h, w = frame.shape[:2]
         if (w, h) != self.size:
-            # A size mismatch makes VideoWriter drop frames silently.
             frame = cv2.resize(frame, self.size)
         self.writer.write(frame)
 
@@ -142,19 +165,99 @@ class Recorder:
         return path
 
 
-def draw_rec_status(frame, seconds):
-    w = frame.shape[1]
-    mins, secs = divmod(int(seconds), 60)
-    cv2.circle(frame, (w - 120, 20), 7, RED, -1)
-    put_text(frame, f"REC {mins:02d}:{secs:02d}", (w - 105, 26), color=RED)
+# ---------- connection handling ----------
 
+def check_reachable(url):
+    """Ask the camera for its headers before handing the URL to OpenCV.
+
+    Returns (ok, message). RTSP cannot be checked with HTTP, so it is skipped.
+    """
+    if url.lower().startswith("rtsp"):
+        return True, ""
+    try:
+        with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, CONNECT_TIMEOUT)) as resp:
+            resp.raise_for_status()
+        return True, ""
+    except requests.exceptions.Timeout:
+        return False, f"The camera did not answer within {CONNECT_TIMEOUT} seconds."
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot reach the camera. Is it on, on the same Wi-Fi, with the right IP and port?"
+    except requests.exceptions.HTTPError as exc:
+        return False, f"The camera answered with an error: {exc}"
+    except requests.exceptions.RequestException as exc:
+        return False, f"Invalid or unusable camera URL: {exc}"
+
+
+def open_camera(url):
+    """Open the stream with timeouts, so it fails instead of hanging."""
+    params = [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CONNECT_TIMEOUT * 1000,
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC, READ_TIMEOUT_MS,
+    ]
+    try:
+        return cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
+    except (TypeError, cv2.error, AttributeError):
+        return cv2.VideoCapture(url)  # older OpenCV without timeout parameters
+
+
+def connect(url):
+    """Return an open capture, or None (after printing why)."""
+    ok, message = check_reachable(url)
+    if not ok:
+        print(message)
+        return None
+    cap = open_camera(url)
+    if not cap.isOpened():
+        cap.release()
+        print("The camera answered, but the video stream could not be opened.")
+        return None
+    return cap
+
+
+def show_status_screen(width, text):
+    """Show a plain screen while reconnecting; Esc still works."""
+    img = np.zeros((int(width * 9 / 16), width, 3), dtype=np.uint8)
+    put_text(img, text, (20, img.shape[0] // 2), scale=0.7, color=AMBER)
+    cv2.imshow(WINDOW_NAME, img)
+
+
+def wait_with_window(seconds, width, text):
+    """Wait while keeping the window responsive. Raises UserQuit on Esc."""
+    end = time.time() + seconds
+    while time.time() < end:
+        show_status_screen(width, text)
+        if cv2.waitKey(100) & 0xFF == ESC_KEY:
+            raise UserQuit()
+
+
+def reconnect(cfg):
+    """Try to reconnect a limited number of times. Returns a capture or None."""
+    limit = cfg["max_reconnects"]
+    for attempt in range(1, limit + 1):
+        print(f"Connection lost. Reconnect attempt {attempt}/{limit}...")
+        text = f"Connection lost - retry {attempt}/{limit}"
+        wait_with_window(cfg["reconnect_delay"], cfg["display_width"], text)
+        cap = connect(cfg["camera_url"])
+        if cap is not None:
+            print("Reconnected.")
+            return cap
+    print(f"Giving up after {limit} reconnect attempts.")
+    return None
+
+
+# ---------- main loop ----------
 
 def run(cfg):
-    cap = cv2.VideoCapture(cfg["camera_url"])
+    cap = connect(cfg["camera_url"])
+    if cap is None:
+        print("Could not start streaming. Check CAMERA_URL in your .env file.")
+        return 1
+
     fps_counter = FpsCounter()
     recorder = Recorder()
     message = ""
     message_until = 0.0
+    read_failures = 0
 
     def notify(text):
         nonlocal message, message_until
@@ -162,23 +265,27 @@ def run(cfg):
         message_until = time.time() + MESSAGE_SECONDS
 
     try:
-        if not cap.isOpened():
-            print("Could not open the camera stream. Check the URL and network.")
-            return 1
-
         print("Streaming. Esc = quit, S = screenshot, R = start/stop recording.")
         while True:
             ok, frame = cap.read()
-            if not ok:
-                print("Failed to read a frame from the camera.")
-                return 1
+            if not ok or frame is None:
+                read_failures += 1
+                if read_failures < MAX_READ_FAILURES:
+                    continue  # a single bad read is not a dropped connection
+                cap.release()
+                cap = reconnect(cfg)
+                if cap is None:
+                    return 1
+                read_failures = 0
+                fps_counter.reset()
+                continue
+            read_failures = 0
 
             frame = resize_to_width(frame, cfg["display_width"])
             fps = fps_counter.update()
             draw_overlay(frame, cfg["camera_name"], fps)
 
-            # Clean copy (overlays, but no REC badge or messages) for saving.
-            snapshot = frame.copy()
+            snapshot = frame.copy()  # overlays, but no REC badge or messages
             recorder.write(snapshot)
 
             if recorder.recording:
@@ -210,11 +317,12 @@ def run(cfg):
                     else:
                         notify("Recording FAILED")
     finally:
-        # Runs on Esc, errors and Ctrl+C: finish the file, then release the camera.
+        # Runs on Esc, Ctrl+C, giving up, and unexpected errors.
         path = recorder.stop()
         if path:
             print(f"Recording finalised: {path}")
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
     return 0
 
@@ -228,9 +336,18 @@ def main():
 
     try:
         return run(cfg)
+    except UserQuit:
+        print("Quit by user.")
+        return 0
     except KeyboardInterrupt:
         print("\nInterrupted by user. Shutting down.")
         return 0
+    except cv2.error as exc:
+        print(f"Video error: {exc}")
+        return 1
+    except Exception as exc:  # last resort: a clear message instead of a traceback
+        print(f"Unexpected error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
