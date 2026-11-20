@@ -122,7 +122,7 @@ lan-camera-viewer/
 ├── .env               # Your real settings (ignored by Git)
 ├── .gitignore
 ├── docs/              # Sample screenshots
-└── tests/
+└── tests/             # Unit tests (python -m unittest discover tests)
 ```
 
 ## Privacy and ethics
